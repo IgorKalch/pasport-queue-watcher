@@ -1,0 +1,60 @@
+name: pasport-queue-watch
+
+on:
+  schedule:
+    # Кожні 5 хвилин. Увага: GitHub може затримувати або пропускати запуски
+    # під навантаженням — реальний інтервал часто 5–15 хв. Можна поставити
+    # "*/10 * * * *", щоб бути ввічливішим до сервера.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # дозволяє запустити вручну з вкладки Actions
+
+concurrency:
+  group: pasport-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Зберігаємо файл стану між запусками через кеш.
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: pasport-state-${{ github.run_id }}
+          restore-keys: |
+            pasport-state-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Playwright/Chromium потрібен ЛИШЕ в режимі браузера (USE_BROWSER=1).
+      # За замовчуванням USE_BROWSER=0 (сайт SSR), тож цей крок пропускається —
+      # це економить ~1–2 хв Actions-часу на кожному прогоні.
+      - name: Install browser (only if USE_BROWSER=1)
+        if: ${{ vars.USE_BROWSER == '1' }}
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run watcher
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Необовʼязкові налаштування — задаються як Repository variables:
+          WATCH_URLS: ${{ vars.WATCH_URLS }}
+          UNAVAILABLE_PHRASES: ${{ vars.UNAVAILABLE_PHRASES }}
+          AVAILABLE_MARKERS: ${{ vars.AVAILABLE_MARKERS }}
+          PAGE_MARKERS: ${{ vars.PAGE_MARKERS }}
+          USE_BROWSER: ${{ vars.USE_BROWSER }}
+          COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
+          HEARTBEAT_HOURS: ${{ vars.HEARTBEAT_HOURS }}
+          ERROR_ALERT_AFTER: ${{ vars.ERROR_ALERT_AFTER }}
+        run: python watch.py
