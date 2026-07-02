@@ -159,6 +159,10 @@ ERROR_ALERT_AFTER = env_int("ERROR_ALERT_AFTER", 3)
 # 0 — вимкнути періодичний heartbeat.
 HEARTBEAT_HOURS = env_float("HEARTBEAT_HOURS", 24)
 
+# Діагностика: "1" — надсилати зведення стану на КОЖНОМУ прогоні (щоб одразу
+# переконатися, що звʼязок з Telegram працює). Для налагодження; потім вимкни.
+DEBUG_PING = env_str("DEBUG_PING", "0") == "1"
+
 # Файл стану (памʼятає стан під час попередньої перевірки).
 STATE_FILE = Path(env_str("STATE_FILE", "state.json"))
 
@@ -530,14 +534,14 @@ def status_word(status: str | None) -> str:
 
 
 def maybe_heartbeat(state: dict, now: datetime) -> None:
-    if HEARTBEAT_HOURS <= 0:
+    if HEARTBEAT_HOURS <= 0 and not DEBUG_PING:
         return
     meta = state.get(META_KEY, {})
     last_hb = meta.get("last_heartbeat")
 
     first_run = last_hb is None
-    due = False
-    if not first_run:
+    due = DEBUG_PING  # у режимі діагностики шлемо щоразу
+    if not first_run and not due:
         try:
             due = now - datetime.fromisoformat(last_hb) >= timedelta(hours=HEARTBEAT_HOURS)
         except Exception:
@@ -556,8 +560,9 @@ def maybe_heartbeat(state: dict, now: datetime) -> None:
         )
     body = "\n".join(lines) if lines else "(немає сторінок для перевірки)"
 
-    title = "🤖 <b>Автомат запущено. Стежу за сторінками:</b>" if first_run \
-        else "🤖 <b>Автомат працює.</b>"
+    title = "🔧 <b>DEBUG: прогін автомата.</b>" if DEBUG_PING \
+        else ("🤖 <b>Автомат запущено. Стежу за сторінками:</b>" if first_run
+              else "🤖 <b>Автомат працює.</b>")
 
     # last_heartbeat оновлюємо лише при успішній відправці, щоб при збої Telegram
     # heartbeat лишався «прострочений» і повторив спробу наступного разу.

@@ -57,4 +57,5 @@ jobs:
           COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
           HEARTBEAT_HOURS: ${{ vars.HEARTBEAT_HOURS }}
           ERROR_ALERT_AFTER: ${{ vars.ERROR_ALERT_AFTER }}
+          DEBUG_PING: ${{ vars.DEBUG_PING }}
         run: python watch.py
