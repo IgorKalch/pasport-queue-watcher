@@ -16,6 +16,7 @@ Pasport e-queue watcher.
 
 import os
 import sys
+import html
 import json
 import time
 import logging
@@ -221,6 +222,17 @@ def save_state(state: dict) -> None:
 # Telegram
 # ----------------------------------------------------------------------------
 
+def esc(value) -> str:
+    """Екранує динамічний вміст для parse_mode=HTML.
+
+    Важливо для повідомлень про помилки: str(виняток) від requests часто містить
+    '<urllib3...object at 0x...>', а незекранований '<' Telegram сприймає як
+    невідомий тег і відповідає HTTP 400 — тоді сповіщення про несправність
+    мовчки не доходить саме тоді, коли воно потрібне.
+    """
+    return html.escape(str(value), quote=False)
+
+
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.error(
@@ -264,19 +276,43 @@ def fetch_html_requests(url: str) -> str:
 
 
 def fetch_html_browser(url: str) -> str:
-    """Завантаження в headless-браузері (виконує JavaScript), повертає HTML."""
+    """Завантаження в headless-браузері (виконує JavaScript), повертає HTML.
+
+    Налаштований так, щоб мати більше шансів пройти Cloudflare: реалістичний
+    контекст (viewport/таймзона/мова), приховане automation-прапорець, і головне
+    — очікування, доки JS-челендж «Just a moment…» сам вирішиться.
+    """
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox"])
-        context = browser.new_context(locale="uk-UA", user_agent=USER_AGENT)
+        browser = p.chromium.launch(args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+        ])
+        context = browser.new_context(
+            locale="uk-UA",
+            timezone_id="Europe/Warsaw",
+            user_agent=USER_AGENT,
+            viewport={"width": 1920, "height": 1080},
+            extra_http_headers={"Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8"},
+        )
         page = context.new_page()
         try:
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
         except Exception:
-            # networkidle іноді не настає — беремо те, що встигло завантажитись
-            log.warning("networkidle не настав для %s, продовжую", url)
-        page.wait_for_timeout(RENDER_WAIT_MS)
+            log.warning("goto не завершився для %s, продовжую", url)
+
+        # Cloudflare-челендж інколи вирішується сам через кілька секунд — чекаємо,
+        # доки зникнуть його маркери (до ~20 c), а тоді ще трохи на дорендер.
+        html = page.content()
+        waited = 0
+        max_wait = max(RENDER_WAIT_MS, 20000)
+        while waited < max_wait and looks_like_challenge(html):
+            page.wait_for_timeout(1000)
+            waited += 1000
+            html = page.content()
+
+        page.wait_for_timeout(min(RENDER_WAIT_MS, 4000))
         html = page.content()
         browser.close()
         return html
@@ -414,8 +450,8 @@ def check_url(url: str, state: dict) -> None:
         if streak >= ERROR_ALERT_AFTER and not prev_error_alerted:
             sent = send_telegram(
                 "⚠️ <b>Автомат не може перевірити сторінку.</b>\n"
-                f"{host}\n{url}\n\n"
-                f"Причина: {detail}\n"
+                f"{esc(host)}\n{esc(url)}\n\n"
+                f"Причина: {esc(detail)}\n"
                 f"Невдалих спроб поспіль: {streak}.\n"
                 "Повідомлю, коли знову запрацює."
             )
@@ -428,14 +464,18 @@ def check_url(url: str, state: dict) -> None:
         return
 
     # --- УСПІШНО прочитали: спершу — відновлення після помилки -----------------
+    # error_alerted скидаємо лише при успішній відправці, інакше збій Telegram
+    # проковтне повідомлення про відновлення (наступний справний прогін повторить).
     if prev_error_alerted:
-        send_telegram(
+        if send_telegram(
             "✅ <b>Автомат знову працює.</b>\n"
-            f"{host}\n"
+            f"{esc(host)}\n"
             f"Поточний стан: {'є місця' if status == AVAILABLE else 'місць немає'}."
-        )
+        ):
+            prev["error_alerted"] = False
+    else:
+        prev["error_alerted"] = False
     prev["error_streak"] = 0
-    prev["error_alerted"] = False
 
     available = status == AVAILABLE
     prev_available = prev_status == AVAILABLE
@@ -457,14 +497,17 @@ def check_url(url: str, state: dict) -> None:
             should_notify = True
 
     if should_notify:
-        note = "" if result["confidence"] == "high" else f"\n⚠️ Невпевнено: {detail}"
-        send_telegram(
+        note = "" if result["confidence"] == "high" else f"\n⚠️ Невпевнено: {esc(detail)}"
+        # last_available_notified записуємо лише при успішній відправці — інакше
+        # разовий збій Telegram у момент появи місць «зʼїсть» головне сповіщення,
+        # і cooldown придушить повтор на COOLDOWN_MIN хвилин.
+        if send_telegram(
             "🟢 <b>Можливо, зʼявилися вільні місця для запису!</b>\n"
-            f"{host}\n{url}\n"
+            f"{esc(host)}\n{esc(url)}\n"
             f"{note}\n\n"
             "Перевір сторінку і спробуй записатися якнайшвидше."
-        )
-        prev["last_available_notified"] = now.isoformat()
+        ):
+            prev["last_available_notified"] = now.isoformat()
 
     prev["status"] = status
     prev["available"] = available
@@ -508,7 +551,7 @@ def maybe_heartbeat(state: dict, now: datetime) -> None:
         st = state.get(url, {})
         host = urlparse(url).netloc
         lines.append(
-            f"{status_emoji(st.get('status'))} {host} — {status_word(st.get('status'))} "
+            f"{status_emoji(st.get('status'))} {esc(host)} — {status_word(st.get('status'))} "
             f"(перевірено {humanize_ago(st.get('last_checked'), now)})"
         )
     body = "\n".join(lines) if lines else "(немає сторінок для перевірки)"
@@ -543,15 +586,18 @@ def run_once() -> None:
 def main() -> int:
     if LOOP_SECONDS > 0:
         log.info("Режим циклу: перевірка кожні %d с. Зупинка — Ctrl+C.", LOOP_SECONDS)
-        while True:
-            try:
-                run_once()
-            except KeyboardInterrupt:
-                log.info("Зупинено користувачем")
-                return 0
-            except Exception as e:
-                log.error("Неочікувана помилка: %s", e)
-            time.sleep(LOOP_SECONDS)
+        # KeyboardInterrupt охоплює й time.sleep (саме там майже завжди й тиснуть
+        # Ctrl+C), тож зупинка завжди чиста, без трейсбеку.
+        try:
+            while True:
+                try:
+                    run_once()
+                except Exception as e:
+                    log.error("Неочікувана помилка: %s", e)
+                time.sleep(LOOP_SECONDS)
+        except KeyboardInterrupt:
+            log.info("Зупинено користувачем")
+            return 0
     else:
         run_once()
     return 0
