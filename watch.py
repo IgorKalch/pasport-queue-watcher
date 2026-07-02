@@ -281,11 +281,24 @@ def send_telegram(text: str) -> bool:
 # ----------------------------------------------------------------------------
 
 def fetch_html_requests(url: str) -> str:
-    """Простий HTTP-запит, повертає сирий HTML."""
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8"}
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.text
+    """HTTP-запит, повертає сирий HTML.
+
+    Cloudflare блокує «TLS-відбиток» бібліотеки requests (повертає 403), але
+    пропускає справжні браузери. Тому за наявності curl_cffi ходимо з імітацією
+    Chrome — це проходить Cloudflare без важкого Playwright. Якщо curl_cffi
+    не встановлено — відкат на requests (може впертися в 403 на таких сайтах).
+    """
+    headers = {"Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8"}
+    try:
+        from curl_cffi import requests as cffi_requests
+        r = cffi_requests.get(url, headers=headers, timeout=30, impersonate="chrome")
+        r.raise_for_status()
+        return r.text
+    except ModuleNotFoundError:
+        headers["User-Agent"] = USER_AGENT
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        return r.text
 
 
 def fetch_html_browser(url: str) -> str:
